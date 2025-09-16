@@ -17,7 +17,7 @@ import random
 
 HUGGING_FACE_API_KEY = "key"
 
-def clean_gpy_mem(*objs):
+def clean_gpu_mem(*objs):
     for o in objs:
         del o
     torch.cuda.empty_cache()
@@ -277,7 +277,7 @@ def get_scores(model_id, lang, structured = True, quant="none", prune=0.0, diacr
     model = None
     tokenizer = None
 
-    clean_gpy_mem(model, tokenizer, enc_plain, logits_plain, log_probs)
+    clean_gpu_mem(model, tokenizer, enc_plain, logits_plain, log_probs)
 
 
 
