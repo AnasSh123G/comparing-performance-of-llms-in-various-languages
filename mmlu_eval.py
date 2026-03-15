@@ -1,42 +1,34 @@
+"""
+MMLU (Massive Multitask Language Understanding) evaluation.
+
+Evaluates model accuracy on multiple-choice questions across many subjects,
+supporting English, Arabic, and German datasets.
+"""
 
 import os
-
-
-devices = "2,3"
-os.environ["CUDA_VISIBLE_DEVICES"] = devices
 import gc
 import csv
 import math
-import random
 import statistics
 import time
 from pathlib import Path
-import pruning
-import datasets
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import datasets
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+import pruning
+import utils
 
-HUGGING_FACE_API_KEY = "key"
 
 DEVICE = "cuda"
 
 
-def set_seed(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 def seq_avg_prob(model, seq_ids, prefix_ids_tensor):
-    """Return exp‑averaged probability and negative log‑likelihood for seq_ids."""
+    # Return exp-averaged probability and negative log-likelihood for *seq_ids*.
     full_ids = torch.cat([
         prefix_ids_tensor,
         torch.tensor(seq_ids, dtype=torch.long, device=prefix_ids_tensor.device),
@@ -52,7 +44,9 @@ def seq_avg_prob(model, seq_ids, prefix_ids_tensor):
     mean_lp = total_lp / len(seq_ids)
     return math.exp(mean_lp), -mean_lp
 
+
 def load_mmlu(lang: str):
+    # Load the MMLU dataset for the given language.
     if lang == 'AR':
         path = "datasets/mmlu_ar_diacritics_cleaned.csv"
         df = pd.read_csv(path)
@@ -70,73 +64,36 @@ def load_mmlu(lang: str):
         df["answer"] = df["answer"].apply(lambda x: letter2idx.get(x, x))
         return df
     elif lang == 'EN':
-        return datasets.load_dataset("cais/mmlu", "all", split="test", token=HUGGING_FACE_API_KEY, trust_remote_code=True)
-
-def load_model(model_name: str, quant: str = "none"):
-    print(f"Loading model {model_name} -> {DEVICE}")
-
-    tok = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=False,
-        token=HUGGING_FACE_API_KEY,
-    )
-    tok.padding_side = "left"
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    if quant == "none":
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=False,
-            token=HUGGING_FACE_API_KEY,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            max_memory={0: "90GiB", 1: "90GiB"},
-            torch_dtype=torch.bfloat16,
-        )
-    elif quant == "4":
-        qconf = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=False,
-            token=HUGGING_FACE_API_KEY,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            max_memory={0: "90GiB"},
-            quantization_config=qconf,
+        return datasets.load_dataset(
+            "cais/mmlu", "all", split="test",
+            token=utils.HUGGING_FACE_API_KEY, trust_remote_code=True,
         )
 
-    elif quant == "8":
-        qconf = BitsAndBytesConfig(
-            load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.float16
-        )
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=False,
-            token=HUGGING_FACE_API_KEY,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            max_memory={0: "90GiB"},
-            quantization_config=qconf,
-        )
-    else:
-        raise ValueError(f"quant must be 'none', '4', or '8', got {quant}")
 
-    mdl.eval()
-    if mdl.config:
-        mdl.config.pad_token_id = tok.pad_token_id
+def _get_pre_prompt(lang: str) -> str:
+    # Return the instruction pre-prompt for the given language.
+    prompts = {
+        'AR': "ستُقَدَّم لك مسألة رياضية أو سؤال مع أربعة خيارات مُقترحة كإجابات محتملة. اختر الإجابة الصحيحة من الخيارات المقدمة فقط. لا تُضِف أي كلمات إضافية في إجابتك. يجب أن تبدأ إجابتك بـ 'ANSWER:'.",
+        'DE': "Du erhältst eine Mathematikaufgabe oder eine Frage mit vier Antwortmöglichkeiten. Wähle ausschließlich die korrekte Antwort aus den gegebenen Optionen. Füge deiner Antwort keine zusätzlichen Wörter hinzu. Deine Antwort muss mit ‚ANSWER:' beginnen.",
+        'EN': "You will be given a math problem or a question with four choices provided as possible answers to the problem. Select the correct answer from the options provided only. Do not include any additional words in your answer. Your answer should start with 'ANSWER:'.",
+    }
+    return prompts[lang]
 
-    return mdl, tok
+
+def _get_mmlu_name(lang: str) -> str:
+    # Return the MMLU dataset name component for output file naming.
+    names = {'AR': "mmlu_ar_diacritics_cleaned.csv", 'DE': "mmlu_de.csv", 'EN': "cais_mmlu_all"}
+    return names[lang]
+
+
+def _get_question_intro(lang: str) -> str:
+    # Return the localised 'Here is the question' connector.
+    intros = {'AR': "\n\nإليك السؤال:\n\n", 'DE': "\n\nHier ist die Frage:\n\n", 'EN': "\n\nHere is the question:\n\n"}
+    return intros[lang]
 
 
 def evaluate(model, tokenizer, dataset, lang: str, pre_prompt: str):
+    # Evaluate the model on the MMLU dataset, returning results and summary stats.
     choice_ids = [tokenizer.encode(f" {c}", add_special_tokens=False) for c in "ABCD"]
 
     results, mem_readings, resp_lens = [], [], []
@@ -154,12 +111,7 @@ def evaluate(model, tokenizer, dataset, lang: str, pre_prompt: str):
             continue
 
         question, subject, gt_idx = row["question"], row["subject"], int(row["answer"])
-        if lang == 'AR':
-            instruction = pre_prompt + ("\n\nإليك السؤال:\n\n")
-        elif lang == 'DE':
-            instruction = pre_prompt + ("\n\nHier ist die Frage:\n\n")
-        else:
-            instruction = pre_prompt + ("\n\nHere is the question:\n\n")
+        instruction = pre_prompt + _get_question_intro(lang)
 
         opts_block = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(choices))
         user_prompt = f"{instruction}{question}\nOptions:\n{opts_block}\nAnswer:"
@@ -192,75 +144,60 @@ def evaluate(model, tokenizer, dataset, lang: str, pre_prompt: str):
 
     total = len(results) or 1
     accuracy = correct * 100 / total
-    return results, accuracy, statistics.mean(mem_readings) if mem_readings else 0.0, statistics.mean(resp_lens) if resp_lens else 0.0
+    return (
+        results,
+        accuracy,
+        statistics.mean(mem_readings) if mem_readings else 0.0,
+        statistics.mean(resp_lens) if resp_lens else 0.0,
+    )
 
 
+def _build_summary_path(model_path, mmlu_name, prune, structured, quant):
+    p = Path(model_path)
+    safe_model = f"{p.parent.name}-{p.name}"
+    base = "results/mmlu_pruning/remaining"
 
-
-def clean_gpu_mem(*objs):
-    for o in objs:
-        del o
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    gc.collect()
+    if prune > 0.0:
+        suffix = "structured" if structured else "unstructured"
+        return f"{base}/results_{mmlu_name}_{safe_model}_pruning_{suffix}_{prune}_diacritics.csv"
+    elif quant != 'none':
+        quant_type = utils.quant_type_label(quant)
+        return f"{base}/results_{mmlu_name}_{safe_model}_{quant_type}_diacritics.csv"
+    else:
+        return f"{base}/results_{mmlu_name}_{safe_model}_diacritics.csv"
 
 
 def run(model_path, lang, structured=True, quant="none", prune=0.0):
+    # Run the full MMLU evaluation pipeline.
+    pre_prompt = _get_pre_prompt(lang)
+    mmlu_name = _get_mmlu_name(lang)
+    quant_type = utils.quant_type_label(quant)
 
-    if lang == 'AR':
-        mmlu_name = "mmlu_ar_diacritics_cleaned.csv"
-        pre_prompt = "ستُقَدَّم لك مسألة رياضية أو سؤال مع أربعة خيارات مُقترحة كإجابات محتملة. اختر الإجابة الصحيحة من الخيارات المقدمة فقط. لا تُضِف أي كلمات إضافية في إجابتك. يجب أن تبدأ إجابتك بـ 'ANSWER:'."
-    elif lang == 'DE':
-        mmlu_name = "mmlu_de.csv"
-        pre_prompt = "Du erhältst eine Mathematikaufgabe oder eine Frage mit vier Antwortmöglichkeiten. Wähle ausschließlich die korrekte Antwort aus den gegebenen Optionen. Füge deiner Antwort keine zusätzlichen Wörter hinzu. Deine Antwort muss mit ‚ANSWER:‘ beginnen."
-    elif lang == 'EN':
-        mmlu_name = "cais_mmlu_all"
-        pre_prompt = "You will be given a math problem or a question with four choices provided as possible answers to the problem. Select the correct answer from the options provided only. Do not include any additional words in your answer. Your answer should start with ‘ANSWER:’."
-
-    if quant == "8":
-        quant_type = "8bit"
-    elif quant == "4":
-        quant_type = "4bit"
-    else:
-        quant_type = "no_quant"
-
-
-    model, tokenizer = load_model(model_path, quant)
+    model, tokenizer = utils.load_model(model_path, quant)[:2]
     print(prune)
     if prune > 0.0:
         model = pruning.update_model(model=model, prune_percent=prune, structured=structured)
         print("model pruned with ", prune*100, " %\n")
-    
+
     dataset = load_mmlu(lang)
 
     start = time.time()
     results, acc, mem_avg, resp_len_avg = evaluate(model, tokenizer, dataset, lang, pre_prompt)
     runtime_min = (time.time() - start) / 60
 
+    summary_path = _build_summary_path(model_path, mmlu_name, prune, structured, quant)
+    Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
+    is_new = not os.path.exists(summary_path) or os.stat(summary_path).st_size == 0
 
     p = Path(model_path)
     safe_model = f"{p.parent.name}-{p.name}"
 
-    if prune > 0.0:
-        if structured:
-            summary_path = f"results/mmlu_pruning/remaining/results_{mmlu_name}_{safe_model}_pruning_structured_{prune}_diacritics.csv"
-        else:
-            summary_path = f"results/mmlu_pruning/remaining/results_{mmlu_name}_{safe_model}_pruning_unstructured_{prune}_diacritics.csv"
-
-    elif quant != 'none':
-        print(quant_type)
-        summary_path = f"results/mmlu_pruning/remaining/results_{mmlu_name}_{safe_model}_{quant_type}_diacritics.csv"
-    else:
-        summary_path = f"results/mmlu_pruning/remaining/results_{mmlu_name}_{safe_model}_diacritics.csv"
-
-    Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
-    is_new = not os.path.exists(summary_path) or os.stat(summary_path).st_size == 0
-    
     with open(summary_path, "a", newline="") as f:
         w = csv.writer(f)
         if is_new:
             w.writerow([
-                "model", "computation_time", "mem_usage", "mem_usage_max", "response_length", "accuracy", "lang","quant_type"
+                "model", "computation_time", "mem_usage", "mem_usage_max",
+                "response_length", "accuracy", "lang", "quant_type",
             ])
         w.writerow([
             safe_model,

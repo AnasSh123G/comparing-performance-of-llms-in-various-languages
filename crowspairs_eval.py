@@ -1,7 +1,8 @@
-import os
-devices = "2"
-os.environ["CUDA_VISIBLE_DEVICES"] = devices
-import gc, csv, re, math, time, statistics
+
+import csv
+import math
+import statistics
+import time
 from pathlib import Path
 from typing import List, Tuple
 
@@ -9,89 +10,12 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 import pruning
+import utils
 
-HUGGING_FACE_API_KEY = 'key'
 
 DEVICE = torch.device("cuda")
-
-def set_seed(seed: int = 42):
-    import random, numpy as np
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def load_model(model_name: str, quant: str):
-    print(f"Loading model {model_name} -> {DEVICE}")
-
-    tok = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=False,
-        token=HUGGING_FACE_API_KEY,
-    )
-    tok.padding_side = "left"
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    if quant == "none":
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=False,
-            token=HUGGING_FACE_API_KEY,
-            device_map="auto",
-            max_memory={0: "90GiB"},
-            torch_dtype=torch.bfloat16,
-        )
-
-    elif quant == "4":
-        qconf = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=False,
-            token=HUGGING_FACE_API_KEY,
-            device_map="auto",
-            max_memory={0: "90GiB"},
-            quantization_config=qconf,
-        )
-
-    elif quant == "8":
-        qconf = BitsAndBytesConfig(
-            load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.float16
-        )
-        mdl = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=False,
-            token=HUGGING_FACE_API_KEY,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            max_memory={0: "90GiB"},
-            quantization_config=qconf,
-        )
-    else:
-        raise ValueError(f"quant must be 'none', '4', or '8', got {quant}")
-    
-    print("\nLoaded Model: ", model_name, "\n Quantization: ", quant)
-
-    mdl.eval()
-    if mdl.config:
-        mdl.config.pad_token_id = tok.pad_token_id
-
-    torch.cuda.reset_peak_memory_stats()
-    mem0 = torch.cuda.memory_allocated() / 1e6
-    torch.cuda.reset_peak_memory_stats()
-
-    return mdl, tok, mem0
-
 
 
 def calculate_logs(
@@ -102,6 +26,7 @@ def calculate_logs(
     mem_readings: list,
     use_cache: bool = True,
 ) -> Tuple[List[float], List[float], float]:
+    # Compute average log-probability, perplexity, and log-sum
     enc = tokenizer(
         prompts,
         add_special_tokens=False,
@@ -141,7 +66,9 @@ def calculate_logs(
 
     return avg_logp.tolist(), ppl.tolist(), log_sum_val
 
+
 def evaluate_bias(df: pd.DataFrame, model, tokenizer, mem_before: float, tag: str):
+    # Evaluate bias across all rows, writing per-row metrics to a CSV.
     csv_file = f"row_metrics_{tag}_pruning_en.csv"
     header = [
         "row_idx",
@@ -213,10 +140,11 @@ def evaluate_bias(df: pd.DataFrame, model, tokenizer, mem_before: float, tag: st
     )
     return stats
 
-def execute(model_path: str, dataset_path: str, quant='none', prune = 0.0, structured=True):
-    
-    set_seed()
-    model, tokenizer, mem_before = load_model(model_path, quant)
+
+def execute(model_path: str, dataset_path: str, quant='none', prune=0.0, structured=True):
+    # Run the full CrowS-Pairs evaluation pipeline.
+    utils.set_seed()
+    model, tokenizer, mem_before = utils.load_model(model_path, quant)
     if prune > 0.0:
         model = pruning.update_model(model=model, prune_percent=prune, structured=structured)
         print("model pruned with ", prune*100, " %\n")
