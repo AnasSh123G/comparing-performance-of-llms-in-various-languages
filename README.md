@@ -1,6 +1,6 @@
 # Comparing Performance of LLMs in Various Languages
 
-**Based on the Master's Thesis: "Comparing Performance of LLMs in Various Languages" (September 2025).**
+**Based on the Master's Thesis: [Comparing Performance of LLMs in Various Languages](./Comapring%20Performance%20of%20LLMs%20in%20Various%20Languages.pdf) (September 2025).**
 
 As large language models (LLMs) see unprecedented daily use across the globe, testing their performance across diverse languages and evaluating the effects of acceleration methods has become critical. This project accompanies the thesis research exploring how techniques like **pruning** and **quantization** (used to fit large models into limited hardware and speed up inference) affect a multilingual model's behavior, quality, and biases in different languages and scenarios.
 
